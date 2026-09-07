@@ -14,7 +14,9 @@ Gli argomenti affrontati finora sono:
 - compilazione e invocazione del grafo;
 - integrazione con un modello servito da `llama-server`;
 - separazione del client del modello tramite un gateway;
-- normalizzazione e validazione dell'output di un LLM.
+- normalizzazione e validazione dell'output di un LLM;
+- checkpointer in memoria, thread e lettura dello stato salvato;
+- separazione tra calcoli Python e risposte generate dal modello.
 
 ## Installazione
 
@@ -224,6 +226,77 @@ Per una classificazione composta da una sola parola, `max_tokens=10` e
 appropriato. Le risposte finali richiedono invece un limite piu ampio: usare
 `max_tokens=10` anche nei nodi di risposta puo troncare il testo generato.
 
+## Checkpointer e memoria dello stato
+
+Un checkpointer salva snapshot dello stato durante l'esecuzione del grafo.
+I checkpoint sono associati a un `thread_id`: usando lo stesso identificativo
+nelle chiamate successive, il grafo recupera lo stato precedente.
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpointer = InMemorySaver()
+grafo = builder.compile(checkpointer=checkpointer)
+
+config_a = {"configurable": {"thread_id": "a"}}
+config_b = {"configurable": {"thread_id": "b"}}
+```
+
+Usare lo stesso grafo e saver permette di mantenere separati i dati dei thread
+A e B. Il thread identifica una sequenza di esecuzioni; non e un thread Python.
+`InMemorySaver` conserva i checkpoint in RAM: terminando il processo o creando
+un nuovo saver, i checkpoint precedenti non sono disponibili in quella nuova
+istanza. Per questi esempi tutte le chiamate vanno eseguite nello stesso processo.
+
+### Input nuovo e valori conservati
+
+Nei nostri grafi, senza reducer personalizzati, un campo fornito nel nuovo
+input sostituisce il valore precedente; un campo omesso conserva quello gia
+salvato. Questo permette di passare soltanto una nuova domanda e continuare a
+usare la materia scelta in precedenza.
+
+Bisogna distinguere i campi da conservare, come `budget` e `totale_speso`, dai
+dati della singola richiesta, come `importo`. Omettere un importo non lo azzera:
+puo lasciare disponibile quello dell'acquisto precedente.
+
+### Valori iniziali e KeyError
+
+`NotRequired[int]` descrive un campo che puo mancare. Non crea la chiave, non
+imposta zero e non effettua validazione automatica dei valori a runtime.
+
+```python
+precedente = stato.get("totale_parole", 0)
+conteggio = len(stato["testo"].split())
+return {"totale_parole": precedente + conteggio}
+```
+
+`get` legge il valore oppure restituisce il default se la chiave manca; non
+inserisce il default nel dizionario. Leggere direttamente
+`stato["totale_parole"]` alla prima chiamata causava il `KeyError` incontrato.
+Nella calcolatrice si leggeva invece `numero`, gia presente nell'input, per
+produrre un nuovo `risultato`: non si leggeva un risultato ancora inesistente.
+
+Passare `totale_parole=0` a ogni invocazione azzererebbe il totale recuperato
+prima del conteggio. Il default va usato soltanto quando il campo manca.
+
+### Ispezionare senza eseguire
+
+```python
+snapshot = grafo.get_state(config_a)
+print(snapshot.values)
+```
+
+`get_state()` restituisce uno snapshot; `.values` contiene i dati salvati.
+Questa lettura non esegue nodi e non incrementa contatori.
+
+### Memoria del grafo e contesto del modello
+
+Salvare lo stato non invia automaticamente una cronologia al modello.
+Il nostro gateway trasmette soltanto il system prompt e il user prompt ricevuti.
+Per far usare una materia memorizzata al tutor, il nodo deve inserirla nel prompt.
+Conservare un campo `risposta` mantiene l'ultima risposta, non accumula da solo
+tutte le risposte precedenti.
+
 ## Esercizi svolti
 
 ### 1. Raddoppio e somma
@@ -363,6 +436,156 @@ Questo esercizio applica correttamente `lower()`, `strip()` e un fallback a
 - mantenere `max_tokens=10` nel solo nodo di classificazione e concedere piu
   token ai nodi che devono generare una risposta completa.
 
+### 6. Conteggio delle parole con memoria
+
+File: [checkpointer.py](checkpointer.py)
+
+```text
+START -> conta_parole -> END
+```
+
+Ogni chiamata passa un nuovo `testo`. Il nodo somma il numero delle nuove parole
+al `totale_parole` recuperato dal checkpoint.
+
+| Thread | Testo | Totale atteso |
+|---|---|---:|
+| 1 | ciao, conteggio | 2 |
+| 1 | oggi studio langgraph | 5 |
+| 2 | prima prova | 2 |
+
+Nel file attuale sono corretti sia l'uso di `get(..., 0)` sia l'annotazione
+`-> dict`. Il nodo restituisce un dizionario di aggiornamenti, non un intero.
+
+### 7. Tutor con materia memorizzata
+
+File: [tutor.py](tutor.py)
+
+```text
+START -> prepara_domanda -> rispondi -> END
+```
+
+`prepara_domanda` recupera la materia o usa `cultura generale`, quindi
+incrementa `numero_domande`. `rispondi` inserisce la materia nel system prompt
+e passa la domanda corrente al gateway con `max_tokens=300`.
+
+| Thread | Sequenza | Materia finale | Numero domande |
+|---|---|---|---:|
+| A | Due domande Python, poi due LangGraph | langgraph | 4 |
+| B | Una domanda di storia | storia | 1 |
+| C | Una domanda senza materia | cultura generale | 1 |
+
+La revisione ha verificato le sei chiamate con risposte del modello simulate,
+controllando prompt e stati finali. Non era una verifica delle conoscenze del
+modello reale.
+
+Due correzioni gia presenti nel file attuale:
+
+- `stato: Stato` annota il tipo del parametro; `stato=Stato` assegnava invece
+  la classe come valore predefinito;
+- una sola istanza di `Gateway` viene riutilizzata dai nodi, invece di crearne
+  una nuova per ogni risposta.
+
+### 8. Assistente per le spese di casa
+
+File: [assistente_spese.py](assistente_spese.py)
+
+```text
+START -> prepara_stato -> classifica -> router
+                                         |
+                       +-----------------+-----------------+
+                       v                                   v
+                 registra_spesa                     leggi_riepilogo
+                       |                                   |
+                       +--------------> rispondi <---------+
+                                           |
+                                          END
+```
+
+L'LLM classifica un messaggio come `spesa` oppure `riepilogo`. Python aggiorna
+il totale e calcola `budget - totale_speso`. Il modello riceve quei numeri per
+formulare la risposta. L'importo viene fornito separatamente dal testo: non
+serve estrarlo con il modello.
+
+`prepara_stato` usa un budget iniziale di 500 e un totale iniziale di zero.
+I thread `casa-anna` e `casa-marco` conservano bilanci distinti.
+
+| Thread | Operazione | Importo | Totale speso | Residuo |
+|---|---|---:|---:|---:|
+| Anna | Supermercato | 25 | 25 | 475 |
+| Anna | Benzina | 40 | 65 | 435 |
+| Marco | Pranzo | 15 | 15 | 485 |
+| Anna | Riepilogo | 0 | 65 | 435 |
+| Marco | Riepilogo | 0 | 15 | 485 |
+
+I totali degli output esaminati erano corretti. Le frasi secondo cui il budget
+era completamente utilizzato, o i calcoli aggiunti erroneamente alla risposta,
+provenivano dal modello. La correttezza dello stato va verificata separatamente
+dalla fedelta del testo generato.
+
+#### Correzioni suggerite per il classificatore
+
+Nella versione inizialmente revisionata, un `break` terminava il `while` dopo
+il primo tentativo. Una classificazione non valida causava un ritorno implicito
+di `None`: su un thread esistente poteva rimanere l'operazione precedente.
+La prova con modello simulato ha confermato il possibile riuso di `spesa`.
+
+Nel file letto per questo aggiornamento il `break` e stato rimosso, ma resta
+la condizione `iterazioni < 3` per accettare una risposta valida. Se i primi due
+tentativi falliscono, dal terzo in poi nessuna risposta puo soddisfare quella
+condizione: il ciclo puo continuare indefinitamente finche le chiamate riescono.
+
+Per l'esercizio basta una chiamata e un fallback. Questo e uno snippet di
+correzione proposto, non una modifica applicata al sorgente:
+
+```python
+def classifica(stato: Stato) -> dict:
+    system_prompt = (
+        "Classifica il messaggio: spesa se registra un acquisto o pagamento, "
+        "riepilogo se chiede il saldo o un riepilogo. "
+        "Rispondi esclusivamente con spesa oppure riepilogo."
+    )
+    operazione = gateway.chiama_modello(
+        system_prompt, stato["messaggio"], max_tokens=10
+    ).strip().lower()
+
+    if operazione not in {"spesa", "riepilogo"}:
+        operazione = "riepilogo"
+
+    return {"operazione": operazione}
+```
+
+Il fallback evita di registrare una spesa quando l'etichetta e fuori
+dall'insieme ammesso. Non rileva una classificazione semanticamente sbagliata
+che restituisce comunque un'etichetta valida.
+
+#### Altri punti della revisione
+
+- Nei due input di riepilogo manca ancora `"importo": 0.0`. Il checkpoint
+  conserva quindi 40 per Anna e 15 per Marco. Con un routing errato quegli
+  importi potrebbero essere aggiunti di nuovo.
+- `operazione` dovrebbe essere `NotRequired[Literal["spesa", "riepilogo"]]`,
+  perche viene prodotta durante il grafo.
+- Il router restituisce una stringa: l'annotazione dovrebbe essere
+  `Literal["spesa", "riepilogo"]`, anziche `dict`.
+- `stato.get("totale_speso", 0)` senza usare il risultato non inizializza nulla.
+  Qui il totale e gia inizializzato da `prepara_stato`.
+- `leggi_riepilogo` puo restituire `{}`: non deve riscrivere tutto lo stato.
+- Nel prompt finale chiedere soltanto i tre importi in euro, senza nuovi
+  calcoli o valutazioni, e impostare per esempio `max_tokens=150`.
+
+Un prompt preciso riduce le digressioni, ma non garantisce che il modello
+riporti esattamente i numeri. Gli importi da mostrare con certezza possono
+essere formattati direttamente in Python:
+
+```python
+residuo = stato["budget"] - stato["totale_speso"]
+print(f"Totale speso: {stato['totale_speso']:.2f} EUR")
+print(f"Disponibilita residua: {residuo:.2f} EUR")
+```
+
+La formattazione a due decimali riguarda la visualizzazione. L'esercizio usa
+`float` e importi non negativi come semplificazione didattica.
+
 ## Errori da ricordare
 
 1. Leggere il campo sbagliato significa ignorare l'aggiornamento del nodo
@@ -378,6 +601,14 @@ Questo esercizio applica correttamente `lower()`, `strip()` e un fallback a
    per un'etichetta, piu token per una spiegazione.
 8. I file sorgente e i prompt devono usare una codifica coerente, preferibilmente
    UTF-8.
+9. `NotRequired` non inizializza i campi: usare `get` con un default quando il
+   valore puo mancare alla prima chiamata.
+10. Un campo omesso puo essere recuperato dal checkpoint: passare sempre i dati
+    della richiesta corrente che non devono essere riutilizzati.
+11. Il classificatore deve aggiornare l'operazione a ogni richiesta, anche
+    quando usa un fallback, per non riutilizzare la decisione precedente.
+12. La memoria dello stato e disponibile al modello solo attraverso i dati
+    che i nodi includono nei prompt.
 
 ## Esecuzione
 
@@ -387,6 +618,7 @@ Gli esercizi senza modello possono essere avviati direttamente:
 python .\langGraph.py
 python .\pipeline_testo.py
 python .\calcolatrice_condizionele.py
+python .\checkpointer.py
 ```
 
 Con `llama-server` attivo, si possono eseguire anche:
@@ -394,5 +626,10 @@ Con `llama-server` attivo, si possono eseguire anche:
 ```powershell
 python .\main_archi_condizionali.py
 python .\classificatore2.py
+python .\tutor.py
+python .\assistente_spese.py
 ```
 
+Prima delle prove dell'assistente spese, applicare la correzione del
+classificatore descritta sopra per evitare il possibile ciclo senza fine.
+Gli esempi con `InMemorySaver` ripartono senza checkpoint a ogni nuovo processo.

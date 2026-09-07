@@ -27,19 +27,19 @@ def classifica_messaggio(stato: Stato) :
 
 def rispondi_domanda(stato: Stato) -> dict:
     system_prompt="sei un assistente che risponde alle domande in arrivo, sii chiaro, fai degli esempi se possibile, e rispondi in modo conciso"
-    risposta=gateway.chiama_modello(system_prompt, stato["richiesta"], max_tokens=10)
+    risposta=gateway.chiama_modello(system_prompt, stato["richiesta"])
 
     return {"risposta": risposta}
 
 def esegui_comando(stato: Stato) -> dict:
     system_prompt="sei un assistente che esegue i comandi in arrivo, sii chiaro, fai degli esempi se possibile, e rispondi in modo conciso"
-    risposta=gateway.chiama_modello(system_prompt, stato["richiesta"], max_tokens=10)
+    risposta=gateway.chiama_modello(system_prompt, stato["richiesta"])
 
     return {"risposta": risposta}
 
 def rispondi_saluto(stato: Stato) -> dict:
     system_prompt="se ti arriva un saluto, rispondi col saluto appropriato"
-    risposta=gateway.chiama_modello(system_prompt, stato["richiesta"], max_tokens=10)
+    risposta=gateway.chiama_modello(system_prompt, stato["richiesta"])
     return {"risposta": risposta}
 
 
@@ -65,7 +65,7 @@ builder.add_edge("rispondi_saluto", END)
 
 grafo=builder.compile()
 
-risposta=grafo.invoke({"richiesta": "ciao"})
+risposta=grafo.invoke({"richiesta": "scrivi un codice cpp che visualizza un ambiente e un cubo 3d"})
 
 print("categoria: "+ risposta["categoria"]+"\n")
 print("Output finale:", risposta["risposta"])

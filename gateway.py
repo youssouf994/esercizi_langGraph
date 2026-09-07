@@ -16,7 +16,7 @@ class Gateway:
 
         return modelli.data[0].id
 
-    def chiama_modello(self, system_prompt: str, user_prompt: str, temperature: float =0.0, max_tokens: int = 300) -> str:
+    def chiama_modello(self, system_prompt: str, user_prompt: str, temperature: float =0.0, max_tokens: int = 10000) -> str:
         response= self.client.chat.completions.create(
             model=self.get_model_id(), 
             messages=[
